@@ -899,6 +899,17 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+// Samples a single-plane BGRA8 surface (e.g. one produced by
+// `render_scene_to_surface`) directly. Metal returns BGRA8Unorm samples already
+// swizzled into RGBA component order, so the sampled value is returned as-is.
+// Reuses `surface_vertex` and the YTexture slot for its lone texture binding.
+fragment float4 surface_fragment_bgra(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> bgra_texture
+                                      [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return bgra_texture.sample(texture_sampler, input.texture_position);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
