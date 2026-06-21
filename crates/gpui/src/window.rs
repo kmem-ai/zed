@@ -2252,6 +2252,71 @@ impl Window {
             .render_to_surface(&self.rendered_frame.scene)
     }
 
+    /// Render an arbitrary `view` as a root element at `size` (logical pixels) into an
+    /// offscreen, IOSurface-backed BGRA `CVPixelBuffer`, **without** disturbing this
+    /// window's live frame, focus, viewport, or input state.
+    ///
+    /// This is the production "Exposé thumbnail" path. A session panel that is *not* in
+    /// the window's view tree — because its grid tile shows a miniature, not the live
+    /// panel — is laid out and painted here at its full maximized `size`, captured to a
+    /// GPU surface, then later sampled (uniformly scaled down) into a small tile rect via
+    /// [`Window::paint_surface`]. Every pixel scales by one factor, so fonts and UI appear
+    /// tiny rather than re-flowed at tile size.
+    ///
+    /// Must be called outside this window's own `draw` (it borrows the shared element
+    /// arena, which a `draw` in progress is using). macOS-only (CoreVideo/Metal).
+    #[cfg(target_os = "macos")]
+    pub fn render_view_to_surface<V: Render>(
+        &mut self,
+        view: &Entity<V>,
+        size: Size<Pixels>,
+        cx: &mut App,
+    ) -> anyhow::Result<core_video::pixel_buffer::CVPixelBuffer> {
+        let scene = self.capture_view_scene(view.clone().into(), size, cx);
+        let device_size = size.to_device_pixels(self.scale_factor());
+        self.platform_window
+            .render_scene_to_surface(&scene, device_size)
+    }
+
+    /// Lay out and paint `view` as a root at `size`, returning the resulting [`Scene`]
+    /// while leaving the window's live `rendered_frame`, `next_frame`, `viewport_size`,
+    /// and focus exactly as they were. A throwaway frame is swapped in for the duration
+    /// of the capture, so this is side-effect-free with respect to the on-screen frame.
+    /// Factored out from [`Window::render_view_to_surface`] so the capture (pure
+    /// layout/paint, no GPU) is testable without Metal.
+    #[cfg(target_os = "macos")]
+    fn capture_view_scene(&mut self, view: AnyView, size: Size<Pixels>, cx: &mut App) -> Scene {
+        let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
+        // Swap a throwaway frame in for the capture so the live `next_frame` (and the
+        // `rendered_frame` it later becomes) are never touched, and point the viewport at
+        // the capture size so full-size roots lay out against the maximized dimensions.
+        let scratch = Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone()));
+        let saved_next = mem::replace(&mut self.next_frame, scratch);
+        let saved_viewport = mem::replace(&mut self.viewport_size, size);
+
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let mut root = view.into_any();
+        root.prepaint_as_root(Point::default(), size.into(), self, cx);
+        self.invalidator.set_phase(DrawPhase::Paint);
+        root.paint(self, cx);
+        self.invalidator.set_phase(DrawPhase::None);
+
+        self.text_system().finish_frame();
+        self.layout_engine.as_mut().unwrap().clear();
+
+        let scene = mem::take(&mut self.next_frame.scene);
+
+        // Restore live state, then drop the captured element before clearing the arena it
+        // was allocated in (the element borrows arena memory).
+        self.next_frame = saved_next;
+        self.viewport_size = saved_viewport;
+        drop(root);
+        cx.element_arena.borrow_mut().clear();
+
+        scene
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -6274,5 +6339,96 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod view_capture_tests {
+    use crate::{
+        Context, Hsla, IntoElement, Render, Styled, TestAppContext, Window, div, hsla, px, size,
+    };
+
+    /// A view whose only content is a full-viewport solid background quad — so the
+    /// captured scene contains one large quad whose bounds equal the capture size.
+    struct SolidPanel {
+        color: Hsla,
+    }
+
+    impl Render for SolidPanel {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(self.color)
+        }
+    }
+
+    /// `capture_view_scene` lays the view out at the *requested* size (not the window's
+    /// own viewport) and is side-effect-free: the live `viewport_size`, `rendered_frame`,
+    /// and `next_frame` are exactly as they were before the capture. This is the core
+    /// invariant of the off-tree-thumbnail fork.
+    #[gpui::test]
+    fn captures_at_requested_size_without_touching_the_live_frame(cx: &mut TestAppContext) {
+        let red = hsla(0.0, 1.0, 0.5, 1.0);
+        let (view, cx) = cx.add_window_view(|_window, _cx| SolidPanel { color: red });
+
+        // Draw the real root once so the assertions below prove the capture leaves a
+        // *populated* live frame untouched, not merely an empty one.
+        cx.update(|window, app| {
+            window.draw(app).clear();
+        });
+
+        // Capture the panel at an explicit "maximized" size that differs from the
+        // window's own viewport, so a broken restore would be visible.
+        let capture_size = size(px(800.0), px(600.0));
+
+        cx.update(|window, app| {
+            let viewport_before = window.viewport_size;
+            let live_len_before = window.rendered_frame.scene.len();
+            assert!(
+                live_len_before > 0,
+                "sanity: the window root produced a non-empty live frame"
+            );
+            assert_ne!(
+                viewport_before, capture_size,
+                "test is only meaningful when the capture size differs from the live viewport"
+            );
+
+            let scale = window.scale_factor();
+            let scene = window.capture_view_scene(view.clone().into(), capture_size, app);
+
+            // The capture produced real geometry.
+            assert!(scene.len() > 0, "capture produced a non-empty scene");
+
+            // The full-viewport background quad covers the *requested* capture size
+            // (in device pixels), proving layout ran at `capture_size`, not the window's
+            // own viewport.
+            let (widest, tallest) = scene.quads.iter().fold((0.0f32, 0.0f32), |(w, h), q| {
+                (w.max(q.bounds.size.width.0), h.max(q.bounds.size.height.0))
+            });
+            assert!(
+                (widest - 800.0 * scale).abs() <= 1.0,
+                "background quad width honors capture size: {widest} vs {}",
+                800.0 * scale
+            );
+            assert!(
+                (tallest - 600.0 * scale).abs() <= 1.0,
+                "background quad height honors capture size: {tallest} vs {}",
+                600.0 * scale
+            );
+
+            // Side-effect-free: the live frame, viewport, and scratch are all restored.
+            assert_eq!(
+                window.viewport_size, viewport_before,
+                "viewport_size restored after capture"
+            );
+            assert_eq!(
+                window.rendered_frame.scene.len(),
+                live_len_before,
+                "live rendered_frame untouched by capture"
+            );
+            assert_eq!(
+                window.next_frame.scene.len(),
+                0,
+                "scratch frame swapped back out of next_frame"
+            );
+        });
     }
 }

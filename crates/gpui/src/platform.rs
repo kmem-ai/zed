@@ -749,6 +749,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_surface(&self, _scene: &Scene) -> Result<core_video::pixel_buffer::CVPixelBuffer> {
         anyhow::bail!("render_to_surface is not implemented for this platform")
     }
+
+    /// Renders an explicitly-provided `scene` into an IOSurface-backed BGRA
+    /// `CVPixelBuffer` sized to `size`, keeping the pixels on the GPU. Unlike
+    /// [`PlatformWindow::render_to_surface`] (which captures this window's own last frame
+    /// at the layer size), this renders a caller-supplied scene at a caller-supplied size
+    /// — the path behind [`crate::Window::render_view_to_surface`] for off-tree session
+    /// thumbnails. macOS-only (CoreVideo/Metal).
+    #[cfg(target_os = "macos")]
+    fn render_scene_to_surface(
+        &self,
+        _scene: &Scene,
+        _size: Size<DevicePixels>,
+    ) -> Result<core_video::pixel_buffer::CVPixelBuffer> {
+        anyhow::bail!("render_scene_to_surface is not implemented for this platform")
+    }
 }
 
 /// A renderer for headless windows that can produce real rendered output.
