@@ -1828,6 +1828,14 @@ impl PlatformWindow for MacWindow {
         this.renderer.render_to_image(scene)
     }
 
+    fn render_to_surface(
+        &self,
+        scene: &gpui::Scene,
+    ) -> anyhow::Result<core_video::pixel_buffer::CVPixelBuffer> {
+        let mut this = self.0.lock();
+        this.renderer.render_to_surface(scene)
+    }
+
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
         let mut lock = self.0.lock();
 

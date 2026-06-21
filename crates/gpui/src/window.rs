@@ -2239,6 +2239,19 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// Renders the current frame's scene into an IOSurface-backed BGRA
+    /// `CVPixelBuffer` and returns it without reading the pixels back to the CPU.
+    ///
+    /// The returned buffer can be drawn directly via [`Window::paint_surface`] —
+    /// scaled into a smaller rectangle — to show a live, uniformly scaled-down
+    /// thumbnail of this window's content (the "Exposé" tile preview). The frame
+    /// is not presented to screen. macOS-only (CoreVideo/Metal).
+    #[cfg(target_os = "macos")]
+    pub fn render_to_surface(&self) -> anyhow::Result<core_video::pixel_buffer::CVPixelBuffer> {
+        self.platform_window
+            .render_to_surface(&self.rendered_frame.scene)
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);

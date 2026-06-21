@@ -14,15 +14,25 @@ use gpui::{
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
-use core_foundation::base::TCFType;
+use core_foundation::{
+    base::{CFType, TCFType},
+    boolean::CFBoolean,
+    dictionary::CFDictionary,
+    number::CFNumber,
+    string::CFString,
+};
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::{CVMetalTextureGetTexture, kCVMetalTextureUsage},
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{
+        CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    },
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
-    RenderPassColorAttachmentDescriptorRef,
+    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, MTLTextureUsage,
+    NSRange, RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
@@ -125,6 +135,9 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    /// Pipeline for sampling a single-plane BGRA8 surface (the zero-copy
+    /// live-thumbnail path), as opposed to the YUV biplanar `surfaces` pipeline.
+    surfaces_pipeline_state_bgra: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -322,6 +335,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surfaces_pipeline_state_bgra = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_bgra",
+            "surface_vertex",
+            "surface_fragment_bgra",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +365,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_pipeline_state_bgra,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -618,6 +640,128 @@ impl MetalRenderer {
                 }
             }
         }
+    }
+
+    /// Renders a scene into a fresh IOSurface-backed BGRA8 [`CVPixelBuffer`] and
+    /// returns it without reading the pixels back to the CPU.
+    ///
+    /// The rendered frame stays in GPU/IOSurface memory, so it can be sampled
+    /// directly by a later [`PaintSurface`] primitive through the BGRA surface
+    /// pipeline — the zero-copy path that draws a live, uniformly scaled-down
+    /// thumbnail of a session's full-size view. Unlike [`render_scene_to_image`],
+    /// this is a production capability (not test-gated): the live GPU client
+    /// produces a session thumbnail this way each frame the panel changes.
+    ///
+    /// [`render_scene_to_image`]: Self::render_scene_to_image
+    pub fn render_scene_to_surface(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<CVPixelBuffer> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for render_scene_to_surface: {:?}", size);
+        }
+        let width = size.width.0 as usize;
+        let height = size.height.0 as usize;
+
+        // Path primitives render through intermediate textures sized to the target.
+        self.update_path_intermediate_textures(size);
+
+        // 1. Allocate an IOSurface-backed, Metal-compatible BGRA pixel buffer.
+        let pixel_buffer = create_bgra_surface_pixel_buffer(width, height)?;
+
+        // 2. Wrap it as a Metal render-target texture via the CoreVideo texture
+        //    cache. The `kCVMetalTextureUsage` attribute is what grants
+        //    RenderTarget usage — without it the cache returns a sample-only
+        //    texture that cannot be attached as a color attachment.
+        let texture_attributes = bgra_render_target_attributes();
+        let cv_texture = self
+            .core_video_texture_cache
+            .create_texture_from_image(
+                pixel_buffer.as_concrete_TypeRef(),
+                Some(&texture_attributes),
+                MTLPixelFormat::BGRA8Unorm,
+                width,
+                height,
+                0,
+            )
+            .map_err(|cv_return| {
+                anyhow::anyhow!("CVMetalTextureCache create failed: CVReturn({cv_return})")
+            })?;
+        // SAFETY: `cv_texture` owns the CVMetalTexture; the borrowed MTLTexture is
+        // valid while `cv_texture` is alive. It is held until the end of this
+        // function, after the GPU work below completes.
+        let target_texture = unsafe {
+            let ptr = CVMetalTextureGetTexture(cv_texture.as_concrete_TypeRef());
+            anyhow::ensure!(!ptr.is_null(), "CVMetalTextureGetTexture returned null");
+            metal::TextureRef::from_ptr(ptr as *mut _)
+        };
+
+        loop {
+            let mut instance_buffer = self
+                .instance_buffer_pool
+                .lock()
+                .acquire(&self.device, self.is_unified_memory);
+
+            let command_buffer =
+                self.draw_primitives_to_texture(scene, &mut instance_buffer, target_texture, size);
+
+            match command_buffer {
+                Ok(command_buffer) => {
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
+
+                    // Wait so the surface is fully rendered before a consumer
+                    // samples it. The pixels live in the IOSurface — no read-back.
+                    command_buffer.commit();
+                    command_buffer.wait_until_completed();
+
+                    // `cv_texture` (kept alive above) is dropped here, after the
+                    // GPU finished writing the surface.
+                    return Ok(pixel_buffer);
+                }
+                Err(err) => {
+                    log::error!(
+                        "failed to render: {}. retrying with larger instance buffer size",
+                        err
+                    );
+                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
+                    let buffer_size = instance_buffer_pool.buffer_size;
+                    if buffer_size >= 256 * 1024 * 1024 {
+                        anyhow::bail!("instance buffer size grew too large: {}", buffer_size);
+                    }
+                    instance_buffer_pool.reset(buffer_size * 2);
+                    log::info!(
+                        "increased instance buffer size to {}",
+                        instance_buffer_pool.buffer_size
+                    );
+                }
+            }
+        }
+    }
+
+    /// Renders `scene` into a fresh BGRA surface sized to this renderer's layer —
+    /// the window-backed companion to `render_scene_to_surface`. Mirrors the
+    /// drawable-size derivation of `render_to_image` but keeps the result on the
+    /// GPU as a reusable `CVPixelBuffer` instead of reading pixels back.
+    pub fn render_to_surface(&mut self, scene: &Scene) -> Result<CVPixelBuffer> {
+        let layer = self
+            .layer
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("render_to_surface requires a layer-backed renderer"))?;
+        let viewport_size = layer.drawable_size();
+        let viewport_size: Size<DevicePixels> = size(
+            (viewport_size.width.ceil() as i32).into(),
+            (viewport_size.height.ceil() as i32).into(),
+        );
+        self.render_scene_to_surface(scene, viewport_size)
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
@@ -1475,7 +1619,9 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        // Both surface pipelines share `surface_vertex`, so the vertex-stage
+        // bindings are set once here; the per-surface pixel format then selects
+        // the fragment pipeline (single-plane BGRA vs. YUV biplanar) in the loop.
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1492,34 +1638,7 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_width() as i32),
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            let pixel_format = surface.image_buffer.get_pixel_format();
 
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
@@ -1537,15 +1656,71 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+
+            // These CVMetalTextures must outlive the `draw_primitives` call below
+            // (the command buffer retains the underlying MTLTextures at encode
+            // time), so they are bound in the loop-body scope, not the branch.
+            let bgra_texture;
+            let y_texture;
+            let cb_cr_texture;
+            if pixel_format == kCVPixelFormatType_32BGRA {
+                // Single-plane BGRA8 surface (e.g. produced by
+                // `render_scene_to_surface`): sample it directly.
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state_bgra);
+                bgra_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::BGRA8Unorm,
+                        surface.image_buffer.get_width(),
+                        surface.image_buffer.get_height(),
+                        0,
+                    )
+                    .unwrap();
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(bgra_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+            } else {
+                // YUV 4:2:0 biplanar surface (e.g. a decoded video frame):
+                // convert to RGB in the fragment shader from its two planes.
+                assert_eq!(pixel_format, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                y_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::R8Unorm,
+                        surface.image_buffer.get_width_of_plane(0),
+                        surface.image_buffer.get_height_of_plane(0),
+                        0,
+                    )
+                    .unwrap();
+                cb_cr_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::RG8Unorm,
+                        surface.image_buffer.get_width_of_plane(1),
+                        surface.image_buffer.get_height_of_plane(1),
+                        1,
+                    )
+                    .unwrap();
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex::CbCrTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
+            }
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
@@ -1592,6 +1767,35 @@ fn new_command_encoder_for_texture<'a>(
         zfar: 1.0,
     });
     command_encoder
+}
+
+/// Builds an IOSurface-backed, Metal-compatible BGRA8 `CVPixelBuffer` to use as
+/// an offscreen render target that a `PaintSurface` primitive can later sample.
+fn create_bgra_surface_pixel_buffer(width: usize, height: usize) -> Result<CVPixelBuffer> {
+    let metal_key: CFString =
+        unsafe { CFString::wrap_under_get_rule(kCVPixelBufferMetalCompatibilityKey) };
+    let iosurface_key: CFString =
+        unsafe { CFString::wrap_under_get_rule(kCVPixelBufferIOSurfacePropertiesKey) };
+    // An empty IOSurface-properties dictionary requests default IOSurface backing.
+    let iosurface_properties: CFDictionary<CFString, CFType> =
+        CFDictionary::from_CFType_pairs(&[] as &[(CFString, CFType)]);
+    let options = CFDictionary::from_CFType_pairs(&[
+        (metal_key, CFBoolean::true_value().into_CFType()),
+        (iosurface_key, iosurface_properties.into_CFType()),
+    ]);
+    CVPixelBuffer::new(kCVPixelFormatType_32BGRA, width, height, Some(&options))
+        .map_err(|cv_return| anyhow::anyhow!("CVPixelBufferCreate failed: CVReturn({cv_return})"))
+}
+
+/// Texture attributes that ask the CoreVideo texture cache for a
+/// render-target-capable Metal texture. The `kCVMetalTextureUsage` value carries
+/// the `MTLTextureUsage` bits; without `RenderTarget` the cache returns a
+/// sample-only texture that cannot be attached as a color attachment.
+fn bgra_render_target_attributes() -> CFDictionary<CFString, CFType> {
+    let usage_key: CFString = unsafe { CFString::wrap_under_get_rule(kCVMetalTextureUsage) };
+    let usage_bits = (MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead).bits() as i64;
+    let usage_value = CFNumber::from(usage_bits);
+    CFDictionary::from_CFType_pairs(&[(usage_key, usage_value.into_CFType())])
 }
 
 fn build_pipeline_state(
@@ -1795,5 +1999,279 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod surface_roundtrip_tests {
+    use super::*;
+    use gpui::{BorderStyle, Corners, Edges, Hsla, bounds, solid_background};
+
+    fn px_bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        bounds(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    fn solid_quad(b: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::default(),
+            bounds: b,
+            content_mask: ContentMask { bounds: b },
+            background: solid_background(color),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    /// Milestone 1 proof for the live-thumbnail path: render a scene into a BGRA
+    /// IOSurface, then paint that surface — scaled down — through the new BGRA
+    /// surface pipeline, and read the composite back.
+    ///
+    /// The source frame is left-red / right-blue. If the box shows red on its
+    /// left and blue on its right with black around it, the whole frame was
+    /// sampled as a *uniformly scaled-down miniature* (Exposé-style), positioned
+    /// correctly — not re-laid-out at tile size. That is the property the tiles
+    /// need, proven end to end with zero CPU pixel copies between the two passes.
+    #[test]
+    fn renders_scene_to_bgra_surface_then_paints_it_scaled_down() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+
+        let frame = size(DevicePixels::from(256), DevicePixels::from(256));
+        let red = Hsla {
+            h: 0.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let blue = Hsla {
+            h: 240.0 / 360.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+
+        // Scene 1: a full 256x256 frame — left half red, right half blue.
+        let mut source = Scene::default();
+        source.insert_primitive(solid_quad(px_bounds(0.0, 0.0, 128.0, 256.0), red));
+        source.insert_primitive(solid_quad(px_bounds(128.0, 0.0, 128.0, 256.0), blue));
+        source.finish();
+
+        let surface = renderer
+            .render_scene_to_surface(&source, frame)
+            .expect("render_scene_to_surface should produce a BGRA surface");
+        assert_eq!(surface.get_pixel_format(), kCVPixelFormatType_32BGRA);
+        assert_eq!(surface.get_width(), 256);
+        assert_eq!(surface.get_height(), 256);
+
+        // Scene 2: paint that surface, scaled by 0.5, into a 128x128 box at (64,64).
+        let box_bounds = px_bounds(64.0, 64.0, 128.0, 128.0);
+        let mut composed = Scene::default();
+        composed.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: box_bounds,
+            content_mask: ContentMask { bounds: box_bounds },
+            image_buffer: surface,
+        });
+        composed.finish();
+
+        let rendered = renderer
+            .render_scene_to_image(&composed, frame)
+            .expect("render_scene_to_image should composite the painted surface");
+
+        let is_red = |p: &image::Rgba<u8>| p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80;
+        let is_blue = |p: &image::Rgba<u8>| p.0[2] > 180 && p.0[0] < 80 && p.0[1] < 80;
+        let is_black = |p: &image::Rgba<u8>| p.0[0] < 40 && p.0[1] < 40 && p.0[2] < 40;
+
+        // Box spans x∈[64,192]; its left half samples the frame's red half, its
+        // right half the blue half — the miniature preserves left/right layout.
+        let box_left = rendered.get_pixel(80, 128);
+        let box_right = rendered.get_pixel(176, 128);
+        assert!(
+            is_red(box_left),
+            "box-left should sample the frame's red half, got {box_left:?}"
+        );
+        assert!(
+            is_blue(box_right),
+            "box-right should sample the frame's blue half, got {box_right:?}"
+        );
+
+        // Outside the box stays black: the thumbnail is placed, not full-bleed.
+        let outside_tl = rendered.get_pixel(20, 20);
+        let outside_br = rendered.get_pixel(236, 236);
+        assert!(
+            is_black(outside_tl),
+            "top-left outside the box should be black, got {outside_tl:?}"
+        );
+        assert!(
+            is_black(outside_br),
+            "bottom-right outside the box should be black, got {outside_br:?}"
+        );
+    }
+
+    fn quad(scene: &mut Scene, x: f32, y: f32, w: f32, h: f32, color: Hsla) {
+        scene.insert_primitive(solid_quad(px_bounds(x, y, w, h), color));
+    }
+
+    /// Builds a mock coding-session view out of plain quads (no text system): a
+    /// title bar with a "working" status dot, transcript lines, a syntax-tinted
+    /// code block, and a prompt bar — enough silhouette that the shrunk-down
+    /// miniature is recognizably the same view.
+    fn build_mock_session_view(scene: &mut Scene) {
+        let bg = Hsla {
+            h: 0.62,
+            s: 0.22,
+            l: 0.12,
+            a: 1.0,
+        };
+        let title = Hsla {
+            h: 0.62,
+            s: 0.40,
+            l: 0.26,
+            a: 1.0,
+        };
+        let working = Hsla {
+            h: 0.58,
+            s: 0.85,
+            l: 0.55,
+            a: 1.0,
+        };
+        let text = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.72,
+            a: 1.0,
+        };
+        let dim = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.45,
+            a: 1.0,
+        };
+        let user = Hsla {
+            h: 0.62,
+            s: 0.5,
+            l: 0.30,
+            a: 1.0,
+        };
+        let code_bg = Hsla {
+            h: 0.62,
+            s: 0.30,
+            l: 0.07,
+            a: 1.0,
+        };
+        let green = Hsla {
+            h: 0.33,
+            s: 0.55,
+            l: 0.55,
+            a: 1.0,
+        };
+        let orange = Hsla {
+            h: 0.07,
+            s: 0.70,
+            l: 0.58,
+            a: 1.0,
+        };
+        let purple = Hsla {
+            h: 0.78,
+            s: 0.45,
+            l: 0.62,
+            a: 1.0,
+        };
+        let prompt = Hsla {
+            h: 0.62,
+            s: 0.28,
+            l: 0.17,
+            a: 1.0,
+        };
+
+        quad(scene, 0.0, 0.0, 960.0, 720.0, bg);
+        quad(scene, 0.0, 0.0, 960.0, 56.0, title);
+        quad(scene, 24.0, 18.0, 20.0, 20.0, working);
+        quad(scene, 60.0, 22.0, 220.0, 12.0, text);
+        quad(scene, 32.0, 92.0, 540.0, 14.0, text);
+        quad(scene, 32.0, 120.0, 620.0, 14.0, dim);
+        quad(scene, 32.0, 148.0, 460.0, 14.0, dim);
+        quad(scene, 32.0, 192.0, 720.0, 26.0, user);
+        quad(scene, 44.0, 199.0, 360.0, 12.0, text);
+        quad(scene, 32.0, 246.0, 896.0, 250.0, code_bg);
+        quad(scene, 52.0, 268.0, 120.0, 12.0, purple);
+        quad(scene, 184.0, 268.0, 240.0, 12.0, text);
+        quad(scene, 72.0, 298.0, 180.0, 12.0, green);
+        quad(scene, 268.0, 298.0, 320.0, 12.0, dim);
+        quad(scene, 72.0, 328.0, 300.0, 12.0, orange);
+        quad(scene, 72.0, 358.0, 220.0, 12.0, green);
+        quad(scene, 304.0, 358.0, 180.0, 12.0, dim);
+        quad(scene, 52.0, 388.0, 140.0, 12.0, purple);
+        quad(scene, 72.0, 418.0, 380.0, 12.0, text);
+        quad(scene, 72.0, 448.0, 260.0, 12.0, orange);
+        quad(scene, 32.0, 520.0, 580.0, 14.0, text);
+        quad(scene, 32.0, 548.0, 500.0, 14.0, dim);
+        quad(scene, 32.0, 632.0, 896.0, 52.0, prompt);
+        quad(scene, 48.0, 651.0, 16.0, 16.0, working);
+        quad(scene, 76.0, 653.0, 300.0, 12.0, dim);
+    }
+
+    /// Opt-in visual artifact (set `KCODE_PROOF_DUMP=1`): renders the mock view
+    /// once into a BGRA surface, then paints that *same* surface as a maximized
+    /// panel plus a 2x2 grid of shrunk tiles, and writes the composite PNG. Every
+    /// tile is the whole view uniformly scaled down — the Exposé/Mission-Control
+    /// effect — proving it visually, not just by pixel assertions.
+    #[test]
+    fn dump_thumbnail_proof_png() {
+        if std::env::var("KCODE_PROOF_DUMP").is_err() {
+            return;
+        }
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+
+        let view_size = size(DevicePixels::from(960), DevicePixels::from(720));
+        let mut view = Scene::default();
+        build_mock_session_view(&mut view);
+        view.finish();
+        let surface = renderer
+            .render_scene_to_surface(&view, view_size)
+            .expect("render mock session view to surface");
+
+        let canvas = size(DevicePixels::from(1280), DevicePixels::from(640));
+        let mut composed = Scene::default();
+        composed.insert_primitive(solid_quad(
+            px_bounds(0.0, 0.0, 1280.0, 640.0),
+            Hsla {
+                h: 0.62,
+                s: 0.15,
+                l: 0.05,
+                a: 1.0,
+            },
+        ));
+        let mut paint = |x: f32, y: f32, w: f32, h: f32| {
+            let b = px_bounds(x, y, w, h);
+            composed.insert_primitive(PaintSurface {
+                order: 0,
+                bounds: b,
+                content_mask: ContentMask { bounds: b },
+                image_buffer: surface.clone(),
+            });
+        };
+        // Maximized panel (left) + a 2x2 grid of live miniatures (right), all 4:3.
+        paint(40.0, 56.0, 700.0, 525.0);
+        paint(780.0, 56.0, 230.0, 172.0);
+        paint(1030.0, 56.0, 230.0, 172.0);
+        paint(780.0, 250.0, 230.0, 172.0);
+        paint(1030.0, 250.0, 230.0, 172.0);
+        drop(paint);
+        composed.finish();
+
+        let image = renderer
+            .render_scene_to_image(&composed, canvas)
+            .expect("compose maximized panel + tiles");
+        let out = "/tmp/kcode_m1_thumbnail_proof.png";
+        image.save(out).expect("save proof png");
+        println!("WROTE {out} ({}x{})", image.width(), image.height());
     }
 }

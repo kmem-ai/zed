@@ -739,6 +739,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+
+    /// Renders the given scene into an IOSurface-backed BGRA `CVPixelBuffer` and
+    /// returns it, keeping the pixels on the GPU (no CPU read-back). The buffer
+    /// can be reused directly as a `PaintSurface` to draw a live, uniformly
+    /// scaled-down thumbnail of the window's content. Unlike `render_to_image`,
+    /// this is a production capability. macOS-only (CoreVideo/Metal).
+    #[cfg(target_os = "macos")]
+    fn render_to_surface(&self, _scene: &Scene) -> Result<core_video::pixel_buffer::CVPixelBuffer> {
+        anyhow::bail!("render_to_surface is not implemented for this platform")
+    }
 }
 
 /// A renderer for headless windows that can produce real rendered output.
