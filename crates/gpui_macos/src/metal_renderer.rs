@@ -668,7 +668,8 @@ impl MetalRenderer {
         self.update_path_intermediate_textures(size);
 
         // 1. Allocate an IOSurface-backed, Metal-compatible BGRA pixel buffer.
-        let pixel_buffer = create_bgra_surface_pixel_buffer(width, height)?;
+        let pixel_buffer =
+            create_metal_surface_pixel_buffer(kCVPixelFormatType_32BGRA, width, height)?;
 
         // 2. Wrap it as a Metal render-target texture via the CoreVideo texture
         //    cache. The `kCVMetalTextureUsage` attribute is what grants
@@ -1769,9 +1770,14 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-/// Builds an IOSurface-backed, Metal-compatible BGRA8 `CVPixelBuffer` to use as
-/// an offscreen render target that a `PaintSurface` primitive can later sample.
-fn create_bgra_surface_pixel_buffer(width: usize, height: usize) -> Result<CVPixelBuffer> {
+/// Builds an IOSurface-backed, Metal-compatible `CVPixelBuffer` of the given
+/// pixel format — for a BGRA8 offscreen render target a `PaintSurface` can later
+/// sample (the live-thumbnail path), and reused by tests for other formats.
+fn create_metal_surface_pixel_buffer(
+    pixel_format: u32,
+    width: usize,
+    height: usize,
+) -> Result<CVPixelBuffer> {
     let metal_key: CFString =
         unsafe { CFString::wrap_under_get_rule(kCVPixelBufferMetalCompatibilityKey) };
     let iosurface_key: CFString =
@@ -1783,7 +1789,7 @@ fn create_bgra_surface_pixel_buffer(width: usize, height: usize) -> Result<CVPix
         (metal_key, CFBoolean::true_value().into_CFType()),
         (iosurface_key, iosurface_properties.into_CFType()),
     ]);
-    CVPixelBuffer::new(kCVPixelFormatType_32BGRA, width, height, Some(&options))
+    CVPixelBuffer::new(pixel_format, width, height, Some(&options))
         .map_err(|cv_return| anyhow::anyhow!("CVPixelBufferCreate failed: CVReturn({cv_return})"))
 }
 
@@ -2273,5 +2279,77 @@ mod surface_roundtrip_tests {
         let out = "/tmp/kcode_m1_thumbnail_proof.png";
         image.save(out).expect("save proof png");
         println!("WROTE {out} ({}x{})", image.width(), image.height());
+    }
+
+    /// Regression smoke test for the YUV branch of `draw_surfaces` (the path the
+    /// BGRA work refactored): build an NV12 (4:2:0 biplanar) surface with a known
+    /// luma + neutral chroma, paint it scaled into a box, and assert the box
+    /// renders a light gray while the surround stays black — proving the YUV
+    /// branch still routes, samples both planes, and converts to RGB.
+    #[test]
+    fn paints_a_yuv_biplanar_surface_through_the_yuv_branch() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+
+        // 64x64 NV12: Y=180 everywhere, Cb=Cr=128 (neutral) → a light gray.
+        let (w, h) = (64usize, 64usize);
+        let yuv =
+            create_metal_surface_pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, w, h)
+                .expect("create nv12 buffer");
+        unsafe {
+            assert_eq!(yuv.lock_base_address(0), 0, "lock nv12 base address");
+            // Plane 0: luma, full resolution, one byte per pixel.
+            let y_ptr = yuv.get_base_address_of_plane(0) as *mut u8;
+            let y_stride = yuv.get_bytes_per_row_of_plane(0);
+            for row in 0..yuv.get_height_of_plane(0) {
+                let line = y_ptr.add(row * y_stride);
+                for col in 0..yuv.get_width_of_plane(0) {
+                    *line.add(col) = 180;
+                }
+            }
+            // Plane 1: chroma, half resolution, interleaved Cb,Cr (two bytes each).
+            let c_ptr = yuv.get_base_address_of_plane(1) as *mut u8;
+            let c_stride = yuv.get_bytes_per_row_of_plane(1);
+            for row in 0..yuv.get_height_of_plane(1) {
+                let line = c_ptr.add(row * c_stride);
+                for col in 0..yuv.get_width_of_plane(1) {
+                    *line.add(col * 2) = 128;
+                    *line.add(col * 2 + 1) = 128;
+                }
+            }
+            assert_eq!(yuv.unlock_base_address(0), 0, "unlock nv12 base address");
+        }
+
+        let frame = size(DevicePixels::from(128), DevicePixels::from(128));
+        let box_bounds = px_bounds(32.0, 32.0, 64.0, 64.0);
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: box_bounds,
+            content_mask: ContentMask { bounds: box_bounds },
+            image_buffer: yuv,
+        });
+        scene.finish();
+
+        let rendered = renderer
+            .render_scene_to_image(&scene, frame)
+            .expect("render the painted nv12 surface");
+
+        // Inside the box: a light, roughly-neutral gray.
+        let inside = rendered.get_pixel(64, 64);
+        let [r, g, b, _] = inside.0;
+        let lo = r.min(g).min(b);
+        let hi = r.max(g).max(b);
+        assert!(lo > 100, "box should be a light gray, got {inside:?}");
+        assert!(
+            hi - lo < 50,
+            "box should be roughly neutral, got {inside:?}"
+        );
+        // Outside the box stays black.
+        let outside = rendered.get_pixel(8, 8);
+        assert!(
+            outside.0[0] < 40 && outside.0[1] < 40 && outside.0[2] < 40,
+            "outside the box should be black, got {outside:?}"
+        );
     }
 }
