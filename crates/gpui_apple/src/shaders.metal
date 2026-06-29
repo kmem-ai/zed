@@ -893,17 +893,36 @@ fragment float4 backdrop_blur_fragment(
     texture2d<float> backdrop
     [[texture(BackdropBlurInputIndex_BackdropTexture)]]) {
   BackdropBlur blur = blurs[input.blur_id];
-  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear);
-  float4 sampled = backdrop.sample(backdrop_sampler, input.texture_coords);
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
+                                     address::clamp_to_edge);
+  // Single-pass Vogel-disk gaussian. A true separable gaussian would need a second render pass plus
+  // an intermediate texture; for a static overlay scrim a golden-angle spiral of TAPS samples —
+  // area-uniform over the blur disk, weighted by a radial gaussian — reads as frosted glass at a
+  // fraction of the taps. The element's own translucent `bg` paints the glass tint on top of this.
+  float2 texel = 1.0 / float2(float(backdrop.get_width()), float(backdrop.get_height()));
+  float radius = max(blur.blur_radius, 1.0);
+  float sigma = radius * 0.5;
+  float two_sigma2 = 2.0 * sigma * sigma;
+  const int TAPS = 48;
+  const float golden_angle = 2.39996323;
+  float3 accum = backdrop.sample(backdrop_sampler, input.texture_coords).rgb;
+  float weight_sum = 1.0;
+  for (int i = 0; i < TAPS; i++) {
+    float t = (float(i) + 0.5) / float(TAPS);
+    float r = radius * sqrt(t);
+    float theta = float(i) * golden_angle;
+    float2 offset = float2(cos(theta), sin(theta)) * r * texel;
+    float w = exp(-(r * r) / two_sigma2);
+    accum += backdrop.sample(backdrop_sampler, input.texture_coords + offset).rgb * w;
+    weight_sum += w;
+  }
+  float3 blurred = accum / weight_sum;
   // Rounded-rect mask with a 1px antialiased edge (the shared shadow/quad SDF convention).
   float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
   float mask = saturate(0.5 - distance);
-  // MILESTONE 1 (plumbing proof): tint the composited backdrop hard toward magenta — unmistakable
-  // against the navy theme (a blue tint was camouflaged). The gaussian blur replaces this next.
-  sampled.rgb = mix(sampled.rgb, float3(1.0, 0.0, 1.0), 0.7);
   // Premultiplied output: the pipeline blends source One / dest (1 - source alpha), so inside the
-  // mask the backdrop copy replaces the drawable and outside it leaves the drawable untouched.
-  return float4(sampled.rgb, 1.0) * mask;
+  // mask the blurred backdrop replaces the drawable and outside it leaves the drawable untouched.
+  return float4(blurred, 1.0) * mask;
 }
 
 struct SurfaceVertexOutput {
