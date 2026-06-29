@@ -847,6 +847,65 @@ fragment float4 path_sprite_fragment(
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
 }
 
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+  uint blur_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  float2 texture_coords;
+  uint blur_id [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float4 device_position =
+      to_device_position(unit_vertex, blur.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds,
+                                                 blur.content_mask.bounds);
+  // The blurred backdrop is sampled at the fragment's own screen position, so the frost lines up
+  // exactly with what it covers.
+  float2 screen_position =
+      float2(blur.bounds.origin.x, blur.bounds.origin.y) +
+      unit_vertex * float2(blur.bounds.size.width, blur.bounds.size.height);
+  float2 texture_coords =
+      screen_position / float2(viewport_size->width, viewport_size->height);
+  return BackdropBlurVertexOutput{
+      device_position,
+      texture_coords,
+      blur_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    texture2d<float> backdrop
+    [[texture(BackdropBlurInputIndex_BackdropTexture)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear);
+  float4 sampled = backdrop.sample(backdrop_sampler, input.texture_coords);
+  // Rounded-rect mask with a 1px antialiased edge (the shared shadow/quad SDF convention).
+  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  float mask = saturate(0.5 - distance);
+  // MILESTONE 1 (plumbing proof): tint the composited backdrop hard toward magenta — unmistakable
+  // against the navy theme (a blue tint was camouflaged). The gaussian blur replaces this next.
+  sampled.rgb = mix(sampled.rgb, float3(1.0, 0.0, 1.0), 0.7);
+  // Premultiplied output: the pipeline blends source One / dest (1 - source alpha), so inside the
+  // mask the backdrop copy replaces the drawable and outside it leaves the drawable untouched.
+  return float4(sampled.rgb, 1.0) * mask;
+}
+
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;

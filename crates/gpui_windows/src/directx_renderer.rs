@@ -321,6 +321,9 @@ impl DirectXRenderer {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
+                // Backdrop blur is implemented on the Metal backend only; elsewhere the overlay
+                // simply isn't frosted (its translucent scrim still draws normally).
+                PrimitiveBatch::BackdropBlurs(_) => Ok(()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
