@@ -1456,6 +1456,9 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    // Backdrop blur is implemented on the Metal backend only; elsewhere the
+                    // overlay simply isn't frosted (its translucent scrim still draws).
+                    PrimitiveBatch::BackdropBlurs(_) => {}
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
                         if paths.is_empty() {
