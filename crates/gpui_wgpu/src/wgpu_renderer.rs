@@ -1308,6 +1308,10 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::ShaderPasses(_) => {
+                            // Shader passes are macOS-only today (#53); implemented for wgpu under #56.
+                            true
+                        }
                     };
                     if !ok {
                         overflow = true;

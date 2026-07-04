@@ -4213,6 +4213,43 @@ impl Window {
         });
     }
 
+    /// Paint a shader pass into the scene for the next frame at the current z-index: a pre-compiled Metal
+    /// fragment shader (`msl`, entry `fragment_entry`) run over `bounds`, bound with `uniforms` (packed to
+    /// the shader's contract) and — when `samples_scene` — the captured scene as `iChannel0`. `shader_id`
+    /// keys the renderer's compiled-pipeline cache, so a given shader is compiled once and reused.
+    ///
+    /// The renderer is generic (it runs compiled MSL, not GLSL); GLSL→MSL translation lives in the caller
+    /// (the Wingman `shader` lib). This method should only be called during the paint phase of drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_shader_pass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shader_id: u64,
+        msl: SharedString,
+        fragment_entry: SharedString,
+        uniforms: Arc<[u8]>,
+        samples_scene: bool,
+    ) {
+        use crate::ShaderPass;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(ShaderPass {
+            order: 0,
+            bounds,
+            content_mask,
+            // Square full-window / background pass for now; per-tile rounded clipping arrives with #53 phase 5.
+            corner_radii: Default::default(),
+            shader_id,
+            msl,
+            fragment_entry,
+            uniforms,
+            samples_scene,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

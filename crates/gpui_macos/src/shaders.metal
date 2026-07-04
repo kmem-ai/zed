@@ -988,6 +988,24 @@ fragment float4 surface_fragment_bgra(SurfaceFragmentInput input [[stage_in]],
   return bgra_texture.sample(texture_sampler, input.texture_position);
 }
 
+struct ShaderPassVertexOutput {
+  float4 position [[position]];
+};
+
+// The static fullscreen-quad vertex paired with every runtime-compiled shader-pass fragment. It just
+// places the unit quad over the pass `bounds`; the fragment (naga-translated Shadertoy MSL) reads its
+// pixel coordinate from `[[position]]` (= `gl_FragCoord`), so no interpolated data is passed across.
+vertex ShaderPassVertexOutput shader_pass_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(ShaderPassInputIndex_Vertices)]],
+    constant Bounds_ScaledPixels *bounds [[buffer(ShaderPassInputIndex_Bounds)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ShaderPassInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position = to_device_position(unit_vertex, *bounds, viewport_size);
+  return ShaderPassVertexOutput{device_position};
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
