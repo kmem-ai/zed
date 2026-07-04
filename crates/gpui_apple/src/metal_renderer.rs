@@ -146,6 +146,10 @@ pub struct MetalRenderer {
     /// Composites the captured-and-blurred backdrop back within a rounded rect (frosted-glass
     /// overlays). Samples `backdrop_blur_texture`; same premultiplied blend as path sprites.
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
+    /// Captures the drawable into the scene texture vertically flipped, before a scene-sampling shader
+    /// pass reads it as `iChannel0` (the shader lib's Shadertoy y-flip expects a bottom-left origin, and
+    /// a Metal blit can't invert). No blending — it overwrites the whole capture target.
+    scene_flip_pipeline_state: metal::RenderPipelineState,
     /// The static fullscreen-quad vertex function paired with every runtime-compiled shader-pass
     /// fragment (each shader-pass pipeline mixes this vertex with the shader's own fragment). Located
     /// once at startup — Metal allows a pipeline's vertex + fragment to come from different libraries.
@@ -375,6 +379,15 @@ impl MetalRenderer {
             "backdrop_blur_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        // No blending: the flip pass overwrites the whole scene-capture texture with the drawable.
+        let scene_flip_pipeline_state = build_copy_pipeline_state(
+            &device,
+            &library,
+            "scene_flip",
+            "scene_flip_vertex",
+            "scene_flip_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         // The static fullscreen-quad vertex shader-pass pipelines pair with each runtime-compiled MSL
         // fragment. Located once; the per-shader fragment is compiled + cached lazily in `shader_pass_pipeline`.
@@ -413,6 +426,7 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             surfaces_pipeline_state_bgra,
             backdrop_blur_pipeline_state,
+            scene_flip_pipeline_state,
             shader_pass_vertex_function,
             shader_pass_sampler,
             shader_pass_pipelines: RefCell::new(HashMap::new()),
@@ -947,26 +961,25 @@ impl MetalRenderer {
                     if passes.iter().any(|pass| pass.samples_scene) {
                         // A scene-sampling pass reads the drawable-so-far as iChannel0; the drawable is
                         // this pass's own render target and cannot also be a shader input, so capture it
-                        // into an off-screen texture first (the same dance as backdrop-blur).
+                        // into an off-screen texture first (the same dance as backdrop-blur). Unlike
+                        // backdrop-blur, capture it VERTICALLY FLIPPED: the shader lib y-flips fragCoord
+                        // to Shadertoy's bottom-left origin, so a straight top-left copy would sample the
+                        // scene upside down. A Metal blit can't invert, so render a full-screen flip.
                         command_encoder.end_encoding();
                         if let Some(ref scene_texture) = self.backdrop_blur_texture {
-                            let blit = command_buffer.new_blit_command_encoder();
-                            blit.copy_from_texture(
-                                texture,
-                                0,
-                                0,
-                                metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                                metal::MTLSize {
-                                    width: viewport_size.width.0 as u64,
-                                    height: viewport_size.height.0 as u64,
-                                    depth: 1,
-                                },
+                            // A `Load` pass (no clear colour): the flip draw covers every pixel of the
+                            // capture target, so whatever it loads is overwritten.
+                            let flip_encoder = new_command_encoder_for_texture(
+                                command_buffer,
                                 scene_texture,
-                                0,
-                                0,
-                                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                                viewport_size,
+                                None,
                             );
-                            blit.end_encoding();
+                            flip_encoder.set_render_pipeline_state(&self.scene_flip_pipeline_state);
+                            flip_encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+                            flip_encoder.set_fragment_texture(0, Some(texture));
+                            flip_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+                            flip_encoder.end_encoding();
                         }
                         command_encoder = new_command_encoder_for_texture(
                             command_buffer,
@@ -1768,6 +1781,37 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// A render pipeline with blending DISABLED — the fragment's returned colour is written straight to
+/// the target. For full-screen copies (e.g. the scene-flip capture) that overwrite every pixel, so
+/// the drawable's own alpha never blends the copy against the target's prior contents.
+fn build_copy_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -2225,6 +2269,96 @@ mod surface_roundtrip_tests {
         assert!(
             is_black(outside_br),
             "bottom-right outside the box should be black, got {outside_br:?}"
+        );
+    }
+
+    /// Regression test for the scene-sampling shader-pass vertical flip. A `samples_scene` pass reads
+    /// the drawable as `iChannel0`; the Wingman shader lib y-flips fragCoord to Shadertoy's bottom-left
+    /// origin, so the renderer must capture the drawable vertically flipped or the sampled scene renders
+    /// upside down. The pass here inverts the scene it samples: a red (top) / blue (bottom) frame must
+    /// come back cyan (top) / yellow (bottom). A straight (un-flipped) capture would swap them; a pass
+    /// that failed to compile and was skipped would leave the raw red/blue through — the colours catch both.
+    #[test]
+    fn scene_sampling_shader_pass_is_not_vertically_flipped() {
+        // A contract-compliant scene-sampling fragment (mirrors the shader lib's emitted `main_` for
+        // `fragColor = 1.0 - texture(iChannel0, uv)`): reads gl_FragCoord, applies the Shadertoy
+        // bottom-left y-flip, samples iChannel0 at slot 0, inverts. Hand-written so the fork test needs
+        // no naga dependency; the y-flip + binding slots are exactly what the capture path relies on.
+        const INVERT_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct Globals { packed_float3 iResolution; };
+struct Out { float4 color [[color(0)]]; };
+fragment Out main_(float4 gl_FragCoord [[position]],
+                   constant Globals& g [[buffer(0)]],
+                   texture2d<float> iChannel0_tex [[texture(0)]],
+                   sampler iChannel0_smp [[sampler(0)]]) {
+    float2 fragCoord = float2(gl_FragCoord.x, g.iResolution.y - gl_FragCoord.y);
+    float2 uv = fragCoord / float2(g.iResolution.x, g.iResolution.y);
+    float4 scene = iChannel0_tex.sample(iChannel0_smp, uv);
+    return Out{ float4(1.0 - scene.rgb, 1.0) };
+}
+"#;
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+        let frame = size(DevicePixels::from(256), DevicePixels::from(256));
+
+        let red = Hsla {
+            h: 0.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let blue = Hsla {
+            h: 240.0 / 360.0,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+
+        let mut scene = Scene::default();
+        // Full frame: top half red, bottom half blue.
+        scene.insert_primitive(solid_quad(px_bounds(0.0, 0.0, 256.0, 128.0), red));
+        scene.insert_primitive(solid_quad(px_bounds(0.0, 128.0, 256.0, 128.0), blue));
+        // A full-frame pass, inserted LAST so it draws on top and captures the red/blue beneath it.
+        let full = px_bounds(0.0, 0.0, 256.0, 256.0);
+        // iResolution packed at offset 0 (packed_float3): the frame size in pixels.
+        let mut uniforms = Vec::new();
+        uniforms.extend_from_slice(&256.0f32.to_le_bytes());
+        uniforms.extend_from_slice(&256.0f32.to_le_bytes());
+        uniforms.extend_from_slice(&1.0f32.to_le_bytes());
+        scene.insert_primitive(ShaderPass {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask { bounds: full },
+            corner_radii: Corners::default(),
+            shader_id: 0xF11A,
+            msl: INVERT_MSL.into(),
+            fragment_entry: "main_".into(),
+            uniforms: Arc::from(uniforms),
+            samples_scene: true,
+        });
+        scene.finish();
+
+        let rendered = renderer
+            .render_scene_to_image(&scene, frame)
+            .expect("render_scene_to_image should composite the scene-sampling pass");
+
+        let is_cyan = |p: &image::Rgba<u8>| p.0[0] < 80 && p.0[1] > 180 && p.0[2] > 180;
+        let is_yellow = |p: &image::Rgba<u8>| p.0[0] > 180 && p.0[1] > 180 && p.0[2] < 80;
+
+        // Top quarter samples the frame's RED top and inverts it -> cyan. Yellow would mean the capture
+        // was vertically flipped (sampled the blue bottom); red would mean the pass was skipped.
+        let top = rendered.get_pixel(128, 64);
+        let bottom = rendered.get_pixel(128, 192);
+        assert!(
+            is_cyan(top),
+            "top should be inverted red (cyan) with an upright scene capture, got {top:?}"
+        );
+        assert!(
+            is_yellow(bottom),
+            "bottom should be inverted blue (yellow) with an upright scene capture, got {bottom:?}"
         );
     }
 

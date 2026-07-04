@@ -1006,6 +1006,34 @@ vertex ShaderPassVertexOutput shader_pass_vertex(
   return ShaderPassVertexOutput{device_position};
 }
 
+struct SceneFlipVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+};
+
+// Captures the drawable into the scene texture VERTICALLY FLIPPED, for a scene-sampling shader pass.
+// The pass reads the drawable as `iChannel0`, and the Wingman shader lib y-flips fragCoord to
+// Shadertoy's bottom-left origin — so a straight (top-left) copy would sample the scene upside down.
+// A Metal blit can't invert, so this full-screen pass samples the source with V flipped. Backdrop-blur
+// samples at top-left screen-uv and keeps its straight blit; only this shader-pass capture flips.
+vertex SceneFlipVertexOutput scene_flip_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id]; // [0,1], (0,0) = top-left
+  // Cover the whole target: unit (0,0) top-left -> clip (-1,+1), unit (1,1) bottom-right -> clip (+1,-1).
+  float4 position = float4(unit_vertex.x * 2.0 - 1.0, 1.0 - unit_vertex.y * 2.0, 0.0, 1.0);
+  // Sample the source upside down so the top of the copy reads the bottom of the drawable.
+  float2 texture_coords = float2(unit_vertex.x, 1.0 - unit_vertex.y);
+  return SceneFlipVertexOutput{position, texture_coords};
+}
+
+fragment float4 scene_flip_fragment(SceneFlipVertexOutput input [[stage_in]],
+                                    texture2d<float> source [[texture(0)]]) {
+  constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  return source.sample(source_sampler, input.texture_coords);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
