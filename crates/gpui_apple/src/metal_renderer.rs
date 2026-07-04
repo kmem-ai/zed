@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, ScaledPixels, Scene, ShaderPass, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -36,7 +36,10 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell, cell::RefCell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit,
+    ops::Range, ptr, slice, sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -143,6 +146,15 @@ pub struct MetalRenderer {
     /// Composites the captured-and-blurred backdrop back within a rounded rect (frosted-glass
     /// overlays). Samples `backdrop_blur_texture`; same premultiplied blend as path sprites.
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
+    /// The static fullscreen-quad vertex function paired with every runtime-compiled shader-pass
+    /// fragment (each shader-pass pipeline mixes this vertex with the shader's own fragment). Located
+    /// once at startup — Metal allows a pipeline's vertex + fragment to come from different libraries.
+    shader_pass_vertex_function: metal::Function,
+    /// Linear / clamp-to-edge sampler bound as `iChannelN` for scene-sampling shader passes.
+    shader_pass_sampler: metal::SamplerState,
+    /// Compiled-pipeline cache for shader passes, keyed by [`gpui::ShaderPass::shader_id`]. Each distinct
+    /// shader is compiled from MSL (`new_library_with_source`) into a pipeline exactly once and reused.
+    shader_pass_pipelines: RefCell<HashMap<u64, metal::RenderPipelineState>>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -364,6 +376,20 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        // The static fullscreen-quad vertex shader-pass pipelines pair with each runtime-compiled MSL
+        // fragment. Located once; the per-shader fragment is compiled + cached lazily in `shader_pass_pipeline`.
+        let shader_pass_vertex_function = library
+            .get_function("shader_pass_vertex", None)
+            .expect("error locating shader_pass_vertex");
+        let shader_pass_sampler = {
+            let descriptor = metal::SamplerDescriptor::new();
+            descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+            descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+            device.new_sampler(&descriptor)
+        };
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -387,6 +413,9 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             surfaces_pipeline_state_bgra,
             backdrop_blur_pipeline_state,
+            shader_pass_vertex_function,
+            shader_pass_sampler,
+            shader_pass_pipelines: RefCell::new(HashMap::new()),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -913,6 +942,41 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::ShaderPasses(range) => {
+                    let passes = &scene.shader_passes[range];
+                    if passes.iter().any(|pass| pass.samples_scene) {
+                        // A scene-sampling pass reads the drawable-so-far as iChannel0; the drawable is
+                        // this pass's own render target and cannot also be a shader input, so capture it
+                        // into an off-screen texture first (the same dance as backdrop-blur).
+                        command_encoder.end_encoding();
+                        if let Some(ref scene_texture) = self.backdrop_blur_texture {
+                            let blit = command_buffer.new_blit_command_encoder();
+                            blit.copy_from_texture(
+                                texture,
+                                0,
+                                0,
+                                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                                metal::MTLSize {
+                                    width: viewport_size.width.0 as u64,
+                                    height: viewport_size.height.0 as u64,
+                                    depth: 1,
+                                },
+                                scene_texture,
+                                0,
+                                0,
+                                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                            );
+                            blit.end_encoding();
+                        }
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            None,
+                        );
+                    }
+                    self.draw_shader_passes(passes, viewport_size, command_encoder);
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1085,6 +1149,110 @@ impl MetalRenderer {
             blurs.len() as u64,
             blurs.start as u64,
         );
+    }
+
+    /// Get, or lazily compile + cache, the render pipeline for a shader pass. On first sight of a
+    /// `shader_id` the MSL is compiled (`new_library_with_source`) and its fragment entry is paired with
+    /// the static `shader_pass_vertex` into a pipeline. A shader that fails to compile is logged and
+    /// skipped (returns `None`) — a bad shader never crashes the renderer.
+    fn shader_pass_pipeline(&self, pass: &ShaderPass) -> Option<metal::RenderPipelineState> {
+        if let Some(pipeline) = self.shader_pass_pipelines.borrow().get(&pass.shader_id) {
+            return Some(pipeline.clone());
+        }
+        let library = match self
+            .device
+            .new_library_with_source(&pass.msl, &metal::CompileOptions::new())
+        {
+            Ok(library) => library,
+            Err(err) => {
+                log::error!("shader pass {} failed to compile: {err}", pass.shader_id);
+                return None;
+            }
+        };
+        let fragment_function = match library.get_function(&pass.fragment_entry, None) {
+            Ok(function) => function,
+            Err(err) => {
+                log::error!(
+                    "shader pass {} missing fragment entry `{}`: {err}",
+                    pass.shader_id,
+                    pass.fragment_entry
+                );
+                return None;
+            }
+        };
+
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        descriptor.set_label("shader_pass");
+        descriptor.set_vertex_function(Some(self.shader_pass_vertex_function.as_ref()));
+        descriptor.set_fragment_function(Some(fragment_function.as_ref()));
+        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+        color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        // No blending: a Shadertoy-convention shader outputs the final colour — a background fills the
+        // target, a post-process samples the scene as iChannel0 and composites itself — so its output
+        // replaces the target rather than alpha-blending over it.
+        color_attachment.set_blending_enabled(false);
+
+        let pipeline = match self.device.new_render_pipeline_state(&descriptor) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                log::error!(
+                    "shader pass {} pipeline creation failed: {err}",
+                    pass.shader_id
+                );
+                return None;
+            }
+        };
+        self.shader_pass_pipelines
+            .borrow_mut()
+            .insert(pass.shader_id, pipeline.clone());
+        Some(pipeline)
+    }
+
+    /// Draw each shader pass as its own fullscreen/bounded quad: bind its cached pipeline, the unit quad
+    /// + the pass bounds/viewport (vertex), the packed uniform bytes (fragment `buffer(0)`), and — for a
+    /// scene-sampling pass — the captured scene as `iChannel0` (`texture(0)`/`sampler(0)`). Distinct
+    /// shaders have distinct pipelines, so passes are drawn individually, not instanced.
+    fn draw_shader_passes(
+        &self,
+        passes: &[ShaderPass],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        for pass in passes {
+            let Some(pipeline) = self.shader_pass_pipeline(pass) else {
+                continue;
+            };
+            command_encoder.set_render_pipeline_state(&pipeline);
+            command_encoder.set_vertex_buffer(
+                ShaderPassInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            command_encoder.set_vertex_bytes(
+                ShaderPassInputIndex::Bounds as u64,
+                mem::size_of::<Bounds<ScaledPixels>>() as u64,
+                &pass.bounds as *const Bounds<ScaledPixels> as *const _,
+            );
+            command_encoder.set_vertex_bytes(
+                ShaderPassInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            // The naga-emitted MSL binds its uniform block at fragment `buffer(0)` (the Wingman shader
+            // lib's METAL_UNIFORM_BUFFER_SLOT); the fork mirrors that fixed slot.
+            command_encoder.set_fragment_bytes(
+                SHADER_PASS_UNIFORM_BUFFER_INDEX,
+                pass.uniforms.len() as u64,
+                pass.uniforms.as_ptr() as *const _,
+            );
+            if pass.samples_scene {
+                if let Some(ref scene_texture) = self.backdrop_blur_texture {
+                    command_encoder.set_fragment_texture(0, Some(scene_texture));
+                    command_encoder.set_fragment_sampler_state(0, Some(&self.shader_pass_sampler));
+                }
+            }
+            command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        }
     }
 
     fn draw_quads(
@@ -1849,6 +2017,20 @@ enum BackdropBlurInputIndex {
     ViewportSize = 2,
     BackdropTexture = 3,
 }
+
+/// The **vertex-stage** buffer slots for `shader_pass_vertex` (see shaders.metal). The fragment stage's
+/// own slots (uniform block, iChannelN texture/sampler) are baked into the runtime-compiled MSL by naga
+/// and are independent of these — see [`SHADER_PASS_UNIFORM_BUFFER_INDEX`].
+#[repr(C)]
+enum ShaderPassInputIndex {
+    Vertices = 0,
+    Bounds = 1,
+    ViewportSize = 2,
+}
+
+/// The **fragment-stage** buffer slot the shader-pass uniform block binds to. Fixed at 0 to match the
+/// Wingman `shader` lib's `METAL_UNIFORM_BUFFER_SLOT` (the naga MSL bakes `[[buffer(0)]]` into the block).
+const SHADER_PASS_UNIFORM_BUFFER_INDEX: u64 = 0;
 
 #[repr(C)]
 enum QuadInputIndex {

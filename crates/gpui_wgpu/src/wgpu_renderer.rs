@@ -1459,6 +1459,8 @@ impl WgpuRenderer {
                     // Backdrop blur is implemented on the Metal backend only; elsewhere the
                     // overlay simply isn't frosted (its translucent scrim still draws).
                     PrimitiveBatch::BackdropBlurs(_) => {}
+                    // Shader passes are macOS-only today (#53); implemented for wgpu under #56.
+                    PrimitiveBatch::ShaderPasses(_) => {}
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
                         if paths.is_empty() {

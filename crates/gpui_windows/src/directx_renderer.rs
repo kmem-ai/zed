@@ -388,6 +388,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Shader passes are macOS-only today (#53); this backend implements them under #56.
+                PrimitiveBatch::ShaderPasses(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

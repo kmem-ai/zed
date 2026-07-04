@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, SharedString, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -51,6 +52,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub shader_passes: Vec<ShaderPass>,
 }
 
 #[expect(missing_docs)]
@@ -68,6 +70,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.shader_passes.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -139,6 +142,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::ShaderPass(pass) => {
+                pass.order = order;
+                self.shader_passes.push(pass.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -167,6 +174,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.shader_passes.sort_by_key(|pass| pass.order);
     }
 
     #[cfg_attr(
@@ -196,6 +204,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            shader_passes_start: 0,
+            shader_passes_iter: self.shader_passes.iter().peekable(),
         }
     }
 }
@@ -221,6 +231,9 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    // Sorts last: at an equal draw order a shader pass composites after the primitives it overlays (a
+    // full-window post-process draws on top; a background shader is given a low order by the caller).
+    ShaderPass,
 }
 
 pub(crate) enum PaintOperation {
@@ -241,6 +254,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    ShaderPass(ShaderPass),
 }
 
 #[expect(missing_docs)]
@@ -256,6 +270,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::ShaderPass(pass) => &pass.bounds,
         }
     }
 
@@ -270,6 +285,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::ShaderPass(pass) => &pass.content_mask,
         }
     }
 }
@@ -300,6 +316,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    shader_passes_start: usize,
+    shader_passes_iter: Peekable<slice::Iter<'a, ShaderPass>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -336,6 +354,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.shader_passes_iter.peek().map(|p| p.order),
+                PrimitiveKind::ShaderPass,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -498,6 +520,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::ShaderPass => {
+                let shader_passes_start = self.shader_passes_start;
+                let mut shader_passes_end = shader_passes_start + 1;
+                self.shader_passes_iter.next();
+                while self
+                    .shader_passes_iter
+                    .next_if(|pass| (pass.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    shader_passes_end += 1;
+                }
+                self.shader_passes_start = shader_passes_end;
+                Some(PrimitiveBatch::ShaderPasses(
+                    shader_passes_start..shader_passes_end,
+                ))
+            }
         }
     }
 }
@@ -531,6 +569,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    ShaderPasses(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -539,6 +578,7 @@ impl PrimitiveBatch {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
+            Self::ShaderPasses(range) => format!("shader passes ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
@@ -835,6 +875,43 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// A post-process shader pass: runs a **pre-compiled Metal fragment shader** over `bounds`, bound with a
+/// packed uniform buffer and (optionally) the captured scene as `iChannel0`. The renderer is generic — it
+/// runs compiled MSL and knows nothing of GLSL/naga/Shadertoy (translation lives in the Wingman `shader`
+/// lib). Used as a window background (low draw order), a full-window post-process (high order, samples the
+/// scene), or a per-tile effect (bounded).
+#[derive(Clone, Debug)]
+pub struct ShaderPass {
+    /// Draw order (assigned by the scene). A background uses a low order; a post-process a high one.
+    pub order: DrawOrder,
+    /// The region the pass covers (full-window or a single tile).
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip rect for the pass.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Rounded-corner radii of `bounds` (0 for a square full-window pass).
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Stable id keying the renderer's compiled-pipeline cache (e.g. a hash of `msl`). A distinct id ⇒ a
+    /// distinct pipeline compiled once and reused; the same id reuses the cached pipeline every frame.
+    pub shader_id: u64,
+    /// The compiled Metal Shading Language source (from `shader::translate`), compiled via
+    /// `new_library_with_source` on first sight of `shader_id`.
+    pub msl: SharedString,
+    /// The fragment entry-point name inside `msl` (naga may rename `main`, e.g. to `main_`).
+    pub fragment_entry: SharedString,
+    /// Raw bytes for the fragment uniform buffer, packed to the shader's contract (see the Wingman
+    /// `shader::ShaderUniforms`), bound at the shader's uniform-buffer slot.
+    pub uniforms: Arc<[u8]>,
+    /// Whether the pass samples the captured scene as `iChannel0` (a post-process) or ignores it (a plain
+    /// background). When true the renderer captures the drawable into a texture and binds it.
+    pub samples_scene: bool,
+}
+
+impl From<ShaderPass> for Primitive {
+    fn from(pass: ShaderPass) -> Self {
+        Primitive::ShaderPass(pass)
     }
 }
 
