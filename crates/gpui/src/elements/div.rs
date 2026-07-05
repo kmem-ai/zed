@@ -1123,6 +1123,15 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Override the drag-arming distance for this element: a press must move more than `threshold`
+    /// before a pending click converts into a drag. Defaults to [`DRAG_THRESHOLD`] (2px). Raise it on
+    /// a click-and-drag element (e.g. a card that both maximizes on click and drags to reorder) so a
+    /// small pointer jitter between mouse-down and mouse-up does not swallow the click.
+    fn drag_threshold(mut self, threshold: Pixels) -> Self {
+        self.interactivity().drag_threshold = Some(f64::from(threshold.0));
+        self
+    }
+
     /// Block the mouse from all interactions with elements behind this element's hitbox. Typically
     /// `block_mouse_except_scroll` should be preferred.
     /// The fluent API equivalent to [`Interactivity::occlude_mouse`].
@@ -1850,6 +1859,10 @@ pub struct Interactivity {
     pub(crate) click_listeners: Vec<ClickListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
+    /// Override for the drag-arming distance in pixels (see [`DRAG_THRESHOLD`]). `None` uses the
+    /// default; raise it so a small pointer jitter between mouse-down and mouse-up does not convert a
+    /// click into a drag and swallow it.
+    pub(crate) drag_threshold: Option<f64>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
@@ -2517,6 +2530,7 @@ impl Interactivity {
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
+        let drag_threshold = self.drag_threshold.unwrap_or(DRAG_THRESHOLD);
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
@@ -2596,7 +2610,7 @@ impl Interactivity {
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
-                            && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
+                            && (event.position - mouse_down.position).magnitude() > drag_threshold
                             && let Some((drag_value, drag_listener)) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
                         {
