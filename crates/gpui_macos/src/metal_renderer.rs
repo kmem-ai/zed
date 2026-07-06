@@ -1507,10 +1507,20 @@ impl MetalRenderer {
         descriptor.set_fragment_function(Some(fragment_function.as_ref()));
         let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
         color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        // No blending: a Shadertoy-convention shader outputs the final colour — a background fills the
-        // target, a post-process samples the scene as iChannel0 and composites itself — so its output
-        // replaces the target rather than alpha-blending over it.
-        color_attachment.set_blending_enabled(false);
+        // Premultiplied-alpha blend (source One, dest OneMinusSourceAlpha) — the same as path sprites.
+        // A Shadertoy-convention pass that outputs an opaque colour (alpha 1.0) still fully replaces the
+        // target under this blend (`src.rgb + dst.rgb*(1-1) = src.rgb`), so every background/post-process
+        // pass is unchanged; a pass that wants to composite *over* the scene — a per-tile glow that must
+        // dissolve into the ambient rather than overwrite it as an opaque rectangle — outputs a
+        // premultiplied colour with a fading alpha and blends correctly.
+        color_attachment.set_blending_enabled(true);
+        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+        color_attachment
+            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
 
         let pipeline = match self.device.new_render_pipeline_state(&descriptor) {
             Ok(pipeline) => pipeline,
