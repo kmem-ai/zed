@@ -2445,6 +2445,20 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
     match event {
         PlatformInput::KeyDown(key_down_event) => {
+            // AppKit's Command-Period legacy-cancel synthesis: pressing ⌘. delivers, alongside the
+            // real ⌘. key equivalent, a FABRICATED bare-Escape key equivalent (keyCode 53, U+001B,
+            // no modifiers) — classic-Mac "cancel" compatibility, still live on current macOS
+            // (verified empirically 2026-08-08 with a CGEvents probe: a physical Escape arrives
+            // only via keyDown, never via performKeyEquivalent, so a bare escape on the
+            // key-equivalent path is always this synthesis). Dispatched, it is indistinguishable
+            // from a real stop/cancel key — in kcode it cancelled running agent turns. Consume it
+            // before the dedup store, the IME replay, and gpui's dispatch ever see it.
+            if key_equivalent
+                && key_down_event.keystroke.key == "escape"
+                && key_down_event.keystroke.modifiers == Modifiers::none()
+            {
+                return YES;
+            }
             // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
             // If that event isn't handled, it will then dispatch a "key down" event. GPUI
             // makes no distinction between these two types of events, so we need to ignore
