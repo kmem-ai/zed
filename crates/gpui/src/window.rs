@@ -2825,8 +2825,11 @@ impl Window {
     ///
     /// Benchmarks drive drawing synchronously rather than through a platform
     /// frame-request loop, so they call this after each measured update to
-    /// submit the frame like production presentation would.
-    #[cfg(feature = "bench")]
+    /// submit the frame like production presentation would. Also exposed under
+    /// `test-support` so offscreen/headless hosts (which pump `draw()` manually,
+    /// never running the platform frame handler) can submit the frame — the step
+    /// that uploads sprite-atlas textures (images) to the GPU.
+    #[cfg(any(feature = "bench", feature = "test-support"))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
             self.present();
