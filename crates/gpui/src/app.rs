@@ -47,8 +47,8 @@ use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
     CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
-    FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId,
-    Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    FocusMap, ForegroundExecutor, Global, ImageId, KeyBinding, KeyContext, Keymap, Keystroke,
+    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
     ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
@@ -2732,14 +2732,39 @@ impl App {
     /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
+        self.release_image_tiles(image.id, image.frame_count(), current_window);
+    }
+
+    /// Releases the atlas tiles of every `RenderImage` dropped since the previous call, on all
+    /// windows. Every `Window::draw` runs this before it paints, so a holder that simply drops its
+    /// last `Arc<RenderImage>` frees the device copy on the next frame without an explicit
+    /// [`Self::drop_image`]. Returns how many images were released.
+    ///
+    /// Pass the window being updated as `current_window` — while a window is inside `update` it is
+    /// held outside `App.windows`, so the fan-out alone cannot reach its atlas.
+    pub fn release_dropped_images(&mut self, mut current_window: Option<&mut Window>) -> usize {
+        let dropped = crate::take_dropped_images();
+        let released = dropped.len();
+        for (id, frame_count) in dropped {
+            self.release_image_tiles(id, frame_count, current_window.as_deref_mut());
+        }
+        released
+    }
+
+    fn release_image_tiles(
+        &mut self,
+        id: ImageId,
+        frame_count: usize,
+        current_window: Option<&mut Window>,
+    ) {
         // remove the texture from all other windows
         for window in self.windows.values_mut().flatten() {
-            _ = window.drop_image(image.clone());
+            window.release_image_tiles(id, frame_count);
         }
 
         // remove the texture from the current window
         if let Some(window) = current_window {
-            _ = window.drop_image(image);
+            window.release_image_tiles(id, frame_count);
         }
     }
 

@@ -10,7 +10,7 @@ use crate::{
     BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    Hsla, ImageId, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
@@ -2935,6 +2935,10 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        // Release the atlas tiles of every `RenderImage` dropped since the last frame, before
+        // anything paints: the previous frame's scene has been drawn, this frame's scene does not
+        // exist yet, so no live scene can still reference a released tile.
+        cx.release_dropped_images(Some(self));
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -4761,16 +4765,20 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        for frame_index in 0..data.frame_count() {
+        self.release_image_tiles(data.id, data.frame_count());
+        Ok(())
+    }
+
+    /// Removes every frame tile of the image `id` from this window's sprite atlas. A no-op for a
+    /// frame that was never painted here.
+    pub(crate) fn release_image_tiles(&mut self, id: ImageId, frame_count: usize) {
+        for frame_index in 0..frame_count {
             let params = RenderImageParams {
-                image_id: data.id,
+                image_id: id,
                 frame_index,
             };
-
-            self.sprite_atlas.remove(&params.clone().into());
+            self.sprite_atlas.remove(&params.into());
         }
-
-        Ok(())
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
@@ -7881,5 +7889,124 @@ mod view_capture_tests {
                 "scratch frame swapped back out of next_frame"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod image_release_tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    use crate::{
+        AtlasKey, Context, IntoElement, Render, RenderImage, RenderImageParams, TestAppContext,
+        Window, div, is_image_release_pending,
+    };
+
+    struct Blank;
+
+    impl Render for Blank {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn two_by_two() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(2, 2),
+        )]))
+    }
+
+    fn frame_key(image: &RenderImage) -> AtlasKey {
+        RenderImageParams {
+            image_id: image.id,
+            frame_index: 0,
+        }
+        .into()
+    }
+
+    /// Upload the image's first frame into `window`'s sprite atlas the way `paint_image` does.
+    fn upload(window: &mut Window, image: &RenderImage) {
+        window
+            .sprite_atlas
+            .get_or_insert_with(&frame_key(image), &mut || {
+                Ok(Some((
+                    image.size(0),
+                    Cow::Borrowed(image.as_bytes(0).expect("one frame")),
+                )))
+            })
+            .expect("test atlas never fails");
+    }
+
+    /// Whether the key's tile is resident: a build closure that declines to build only runs when
+    /// the tile is absent, so the atlas answers `Some` exactly for a resident tile.
+    fn is_resident(window: &mut Window, key: &AtlasKey) -> bool {
+        window
+            .sprite_atlas
+            .get_or_insert_with(key, &mut || Ok(None))
+            .expect("test atlas never fails")
+            .is_some()
+    }
+
+    /// The fork's automatic texture release: dropping the last `Arc<RenderImage>` queues its atlas
+    /// tiles, and the next `draw` releases them — without any holder calling `drop_image`. Another
+    /// image's tile in the same atlas is untouched.
+    #[gpui::test]
+    fn dropping_the_last_render_image_handle_releases_its_tiles_on_the_next_draw(
+        cx: &mut TestAppContext,
+    ) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Blank);
+        let image = two_by_two();
+        let survivor = two_by_two();
+        let (key, survivor_key) = (frame_key(&image), frame_key(&survivor));
+        let id = image.id;
+
+        cx.update(|window, _cx| {
+            upload(window, &image);
+            upload(window, &survivor);
+            assert!(is_resident(window, &key));
+        });
+
+        drop(image);
+        assert!(
+            is_image_release_pending(id),
+            "the last handle's drop queues the atlas release"
+        );
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        assert!(!is_image_release_pending(id), "the draw drained the queue");
+        cx.update(|window, _cx| {
+            assert!(
+                !is_resident(window, &key),
+                "the dropped image's tile is gone"
+            );
+            assert!(
+                is_resident(window, &survivor_key),
+                "a live image's tile survives the release"
+            );
+        });
+    }
+
+    /// A clone keeps the texture: nothing is queued until the last handle goes.
+    #[gpui::test]
+    fn a_surviving_handle_keeps_the_tiles_resident_across_a_draw(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Blank);
+        let image = two_by_two();
+        let shared = Arc::clone(&image);
+        let key = frame_key(&image);
+        let id = image.id;
+
+        cx.update(|window, _cx| upload(window, &image));
+        drop(image);
+        assert!(!is_image_release_pending(id));
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, _cx| assert!(is_resident(window, &key)));
+        drop(shared);
+        assert!(is_image_release_pending(id));
     }
 }

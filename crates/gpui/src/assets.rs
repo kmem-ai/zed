@@ -2,6 +2,7 @@ use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
 
 use image::{Delay, Frame};
+use parking_lot::Mutex;
 use std::{
     borrow::Cow,
     fmt,
@@ -106,6 +107,42 @@ impl RenderImage {
     }
 }
 
+/// Images whose last `RenderImage` handle dropped and whose sprite-atlas tiles are still to be
+/// released: `(id, frame_count)`. Drained by [`crate::App::release_dropped_images`], which every
+/// [`crate::Window::draw`] runs before it paints.
+static DROPPED_IMAGES: Mutex<Vec<(ImageId, usize)>> = Mutex::new(Vec::new());
+
+/// Dropping the last handle to a `RenderImage` frees its CPU pixels here and queues its atlas tiles
+/// for release on every window's next draw. Without this, the device copy an earlier
+/// `Window::paint_image` uploaded outlived the image until a holder remembered to call
+/// `App::drop_image` — and any holder that decoded more than once (a per-frame re-decode, a frame
+/// stream, a cache eviction) leaked one texture per decode.
+impl Drop for RenderImage {
+    fn drop(&mut self) {
+        if !self.data.is_empty() {
+            DROPPED_IMAGES.lock().push((self.id, self.data.len()));
+        }
+    }
+}
+
+/// Take every image dropped since the previous call, for the atlas release.
+pub(crate) fn take_dropped_images() -> Vec<(ImageId, usize)> {
+    std::mem::take(&mut *DROPPED_IMAGES.lock())
+}
+
+/// How many dropped images still await the atlas release the next draw performs.
+pub fn dropped_images_pending() -> usize {
+    DROPPED_IMAGES.lock().len()
+}
+
+/// Whether the image with `id` has been dropped and still awaits its atlas release.
+pub fn is_image_release_pending(id: ImageId) -> bool {
+    DROPPED_IMAGES
+        .lock()
+        .iter()
+        .any(|(dropped, _)| *dropped == id)
+}
+
 impl fmt::Debug for RenderImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ImageData")
@@ -119,6 +156,26 @@ impl fmt::Debug for RenderImage {
 mod tests {
     use super::*;
     use smallvec::SmallVec;
+
+    #[test]
+    fn dropping_a_render_image_queues_its_atlas_release() {
+        let frame = image::Frame::new(image::RgbaImage::new(1, 1));
+        let image = RenderImage::new(vec![frame]);
+        let id = image.id;
+        assert!(!is_image_release_pending(id));
+        drop(image);
+        assert!(is_image_release_pending(id));
+        assert!(take_dropped_images().contains(&(id, 1)));
+        assert!(!is_image_release_pending(id));
+    }
+
+    #[test]
+    fn dropping_a_frameless_render_image_queues_nothing() {
+        let image = RenderImage::new(SmallVec::new());
+        let id = image.id;
+        drop(image);
+        assert!(!is_image_release_pending(id));
+    }
 
     #[test]
     fn empty_render_image_does_not_panic() {
