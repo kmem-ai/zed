@@ -47,6 +47,8 @@ impl LineWrapper {
         let mut indent = None;
         let mut last_candidate_ix = 0;
         let mut last_candidate_width = px(0.);
+        let mut last_soft_ix = 0;
+        let mut last_soft_width = px(0.);
         let mut last_wrap_ix = 0;
         let mut prev_c = '\0';
         let mut index = 0;
@@ -65,16 +67,22 @@ impl LineWrapper {
                             continue;
                         }
 
-                        if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
+                        if c != ' ' && first_non_whitespace_ix.is_some() {
+                            if prev_c == ' '
+                                || !Self::is_word_char(c) && !Self::is_soft_break_char(c)
+                            {
+                                // A word start after a space — or a script that may not be space
+                                // separated (CJK, e.g. `Hello world你好世界`), where every character
+                                // may start a line.
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
-                            }
-                        } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
+                            } else if Self::is_soft_break_char(c) {
+                                // Punctuation inside a token (`a/b`, `foo?b=2`): a fallback break,
+                                // taken only when no space break can keep the token whole — a long
+                                // path or URL moves to the next line intact when it fits there and
+                                // wraps at a slash only when it cannot.
+                                last_soft_ix = ix;
+                                last_soft_width = width;
                             }
                         }
 
@@ -116,13 +124,28 @@ impl LineWrapper {
                         last_wrap_ix = last_candidate_ix;
                         width -= last_candidate_width;
                         last_candidate_ix = 0;
+                        // A soft break inside the token that now heads the new line stays available
+                        // to that line, re-based on the line's start.
+                        if last_soft_ix > last_wrap_ix {
+                            last_soft_width -= last_candidate_width;
+                        } else {
+                            last_soft_ix = 0;
+                        }
+                    } else if last_soft_ix > 0 {
+                        last_wrap_ix = last_soft_ix;
+                        width -= last_soft_width;
+                        last_soft_ix = 0;
                     } else {
                         last_wrap_ix = ix;
                         width = item_width;
                     }
 
                     if let Some(indent) = indent {
-                        width += self.width_for_char(' ') * indent as f32;
+                        let indent_width = self.width_for_char(' ') * indent as f32;
+                        width += indent_width;
+                        if last_soft_ix > 0 {
+                            last_soft_width += indent_width;
+                        }
                     }
 
                     return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
@@ -339,6 +362,8 @@ impl LineWrapper {
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = 0usize;
         let mut last_candidate_width = px(0.);
+        let mut last_soft_ix = 0usize;
+        let mut last_soft_width = px(0.);
         let mut last_wrap_ix = 0usize;
         let mut prev_c = '\0';
         let mut indent: Option<u32> = None;
@@ -368,6 +393,8 @@ impl LineWrapper {
                 first_non_whitespace_ix = None;
                 last_candidate_ix = 0;
                 last_candidate_width = px(0.);
+                last_soft_ix = 0;
+                last_soft_width = px(0.);
                 last_wrap_ix = ix + 1;
                 prev_c = '\0';
                 indent = None;
@@ -377,14 +404,17 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
+            // The same three-way rule as `wrap_line`: a word start after a space (or any character of
+            // a script that is not space separated) is a break; punctuation inside a token is the
+            // fallback break for a token longer than the line.
+            if c != ' ' && first_non_whitespace_ix.is_some() {
+                if prev_c == ' ' || !Self::is_word_char(c) && !Self::is_soft_break_char(c) {
                     last_candidate_ix = ix;
                     last_candidate_width = width;
+                } else if Self::is_soft_break_char(c) {
+                    last_soft_ix = ix;
+                    last_soft_width = width;
                 }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = ix;
-                last_candidate_width = width;
             }
 
             if c != ' ' && first_non_whitespace_ix.is_none() {
@@ -404,13 +434,26 @@ impl LineWrapper {
                         last_wrap_ix = last_candidate_ix;
                         width -= last_candidate_width;
                         last_candidate_ix = 0;
+                        if last_soft_ix > last_wrap_ix {
+                            last_soft_width -= last_candidate_width;
+                        } else {
+                            last_soft_ix = 0;
+                        }
+                    } else if last_soft_ix > last_wrap_ix {
+                        last_wrap_ix = last_soft_ix;
+                        width -= last_soft_width;
+                        last_soft_ix = 0;
                     } else {
                         last_wrap_ix = ix;
                         width = char_width;
                     }
 
                     if let Some(ind) = indent {
-                        width += self.width_for_char(' ') * ind as f32;
+                        let indent_width = self.width_for_char(' ') * ind as f32;
+                        width += indent_width;
+                        if last_soft_ix > 0 {
+                            last_soft_width += indent_width;
+                        }
                     }
 
                     line += 1;
@@ -443,6 +486,15 @@ impl LineWrapper {
 
         // Text fits within max_lines without truncation.
         (text, Cow::Borrowed(runs))
+    }
+
+    /// ASCII punctuation that is not a word character (`/`, `?`, `&`, `+`, `\`, `*`, `|`, the
+    /// opening brackets, the backtick): inside a token it is a *soft* break — a place a line may wrap
+    /// when the token is longer than the line, but never preferred over a space break that would
+    /// carry the token whole to the next line. Spaces are neither; every other ASCII character is a
+    /// word character.
+    pub(crate) fn is_soft_break_char(c: char) -> bool {
+        c.is_ascii() && !c.is_ascii_whitespace() && !Self::is_word_char(c)
     }
 
     /// Any character in this list should be treated as a word character,
@@ -862,6 +914,99 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
         );
+    }
+
+    /// A width of `n` characters of the test font (a monospace face, so every ASCII glyph is one cell).
+    fn chars(wrapper: &mut LineWrapper, n: f32) -> Pixels {
+        wrapper.width_for_char('a') * n
+    }
+
+    #[test]
+    fn test_wrap_line_keeps_a_slashed_token_whole_when_it_fits_on_the_next_line() {
+        let mut wrapper = build_wrapper();
+        // "go " + the 15-character URL overflows a 16.5-character line; the URL alone fits, so the
+        // break is the space before it — not the last slash inside it.
+        let width = chars(&mut wrapper, 16.5);
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("go https://k.co/ab")], width)
+                .collect::<Vec<_>>(),
+            &[Boundary::new(3, 0)],
+        );
+    }
+
+    #[test]
+    fn test_wrap_line_falls_back_to_a_slash_when_the_token_is_longer_than_the_line() {
+        let mut wrapper = build_wrapper();
+        // An 18-character URL in a 10.5-character line, with no space to break at: each line ends at
+        // the last slash that fits on it.
+        let width = chars(&mut wrapper, 10.5);
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("https://k.co/ab/cd")], width)
+                .collect::<Vec<_>>(),
+            &[Boundary::new(7, 0), Boundary::new(15, 0)],
+        );
+    }
+
+    #[test]
+    fn test_wrap_line_carries_a_slash_break_over_to_the_line_the_token_moves_to() {
+        let mut wrapper = build_wrapper();
+        // The URL moves whole to the second line (the space break wins), then is longer than that line
+        // too, so it wraps at its last fitting slash — a soft break seen on the first line, kept.
+        let width = chars(&mut wrapper, 15.5);
+        assert_eq!(
+            wrapper
+                .wrap_line(
+                    &[LineFragment::text("see https://k.co/ab/cd/ef now")],
+                    width
+                )
+                .collect::<Vec<_>>(),
+            &[Boundary::new(4, 0), Boundary::new(19, 0)],
+        );
+    }
+
+    #[test]
+    fn test_wrap_line_still_breaks_before_punctuation_that_follows_a_space() {
+        let mut wrapper = build_wrapper();
+        // An opening bracket after a space starts a word like any other: the line breaks there.
+        let width = chars(&mut wrapper, 10.5);
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aaaa (bbbb) cccc")], width)
+                .collect::<Vec<_>>(),
+            &[Boundary::new(5, 0), Boundary::new(12, 0)],
+        );
+    }
+
+    #[test]
+    fn test_truncate_wrapped_line_keeps_a_slashed_token_whole_when_it_fits_on_the_next_line() {
+        let mut wrapper = build_wrapper();
+        // Two lines of 16.5 characters: the URL moves whole to the second line, which then overflows
+        // at " xyz" and truncates — where a slash break would have split the URL across the lines and
+        // let the tail fit.
+        let width = chars(&mut wrapper, 16.5);
+        let text = SharedString::from("go https://k.co/ab xyz");
+        let runs = generate_test_runs(&[text.len()]);
+        let (result, _) =
+            wrapper.truncate_wrapped_line(text, width, 2, "…", &runs, TruncateFrom::End);
+        assert_eq!(result.as_ref(), "go https://k.co/ab…");
+    }
+
+    #[test]
+    fn test_is_soft_break_char() {
+        for c in [
+            '/', '?', '&', '+', '\\', '*', '|', '(', '[', '{', '<', '>', '`',
+        ] {
+            assert!(LineWrapper::is_soft_break_char(c), "{c:?} is a soft break");
+        }
+        // `"` closes as well as opens, so upstream keeps it a word character (no line starts with it).
+        for c in ['a', '9', '-', '_', '.', ',', ':', ')', '"', ' ', '你', '—'] {
+            assert!(
+                !LineWrapper::is_soft_break_char(c),
+                "{c:?} is not a soft break"
+            );
+        }
     }
 
     #[test]

@@ -197,6 +197,7 @@ impl LineLayout {
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
+        let mut last_soft: Option<(WrapBoundary, Pixels)> = None;
         let mut last_boundary = WrapBoundary {
             run_ix: 0,
             glyph_ix: 0,
@@ -225,16 +226,18 @@ impl LineLayout {
             }
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+            // but there are some differences, so we have to duplicate the code here. The same
+            // three-way rule: a word start after a space (or any character of a script that is not
+            // space separated) is a break; punctuation inside a token is the fallback break for a
+            // token longer than the line.
+            if ch != ' ' && first_non_whitespace_ix.is_some() {
+                if prev_ch == ' '
+                    || !LineWrapper::is_word_char(ch) && !LineWrapper::is_soft_break_char(ch)
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
+                } else if LineWrapper::is_soft_break_char(ch) {
+                    last_soft = Some((boundary, x));
                 }
             }
 
@@ -256,6 +259,12 @@ impl LineLayout {
                 if let Some(last_candidate_ix) = last_candidate_ix.take() {
                     last_boundary = last_candidate_ix;
                     last_boundary_x = last_candidate_x;
+                } else if let Some((soft, soft_x)) = last_soft.take_if(|(b, _)| *b > last_boundary)
+                {
+                    // Glyph positions are absolute, so a soft break seen before an earlier space
+                    // break is still valid here as long as it lies past that break.
+                    last_boundary = soft;
+                    last_boundary_x = soft_x;
                 } else {
                     last_boundary = boundary;
                     last_boundary_x = x;
@@ -1045,6 +1054,53 @@ mod tests {
             }],
             len: 0,
         }
+    }
+
+    /// A layout of `text` at ten pixels a glyph, the shape a monospace face gives ASCII.
+    fn layout_of(text: &str) -> LineLayout {
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(n, (index, _))| glyph_at(10. * n as f32, index))
+            .collect();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(10. * text.chars().count() as f32);
+        layout.len = text.len();
+        layout
+    }
+
+    fn boundary(glyph_ix: usize) -> WrapBoundary {
+        WrapBoundary {
+            run_ix: 0,
+            glyph_ix,
+        }
+    }
+
+    #[test]
+    fn test_wrap_boundaries_keep_a_slashed_token_whole_when_it_fits_on_the_next_line() {
+        // "go " + the 15-glyph URL overflows 165 px; the URL alone fits, so the line breaks at the
+        // space before it rather than at the last slash inside it.
+        let text = "go https://k.co/ab";
+        let boundaries = layout_of(text).compute_wrap_boundaries(text, px(165.), None);
+        assert_eq!(boundaries.as_slice(), &[boundary(3)]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_fall_back_to_a_slash_when_the_token_is_longer_than_the_line() {
+        // An 18-glyph URL in a 105 px line with no space to break at: each line ends at the last
+        // slash that fits on it.
+        let text = "https://k.co/ab/cd";
+        let boundaries = layout_of(text).compute_wrap_boundaries(text, px(105.), None);
+        assert_eq!(boundaries.as_slice(), &[boundary(7), boundary(15)]);
+    }
+
+    #[test]
+    fn test_wrap_boundaries_carry_a_slash_break_over_to_the_line_the_token_moves_to() {
+        // The URL moves whole to the second line, is longer than it too, and wraps at its last
+        // fitting slash — one seen on the first line.
+        let text = "see https://k.co/ab/cd/ef now";
+        let boundaries = layout_of(text).compute_wrap_boundaries(text, px(155.), None);
+        assert_eq!(boundaries.as_slice(), &[boundary(4), boundary(19)]);
     }
 
     fn glyph_x_positions(layout: &LineLayout) -> Vec<f32> {
