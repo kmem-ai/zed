@@ -2751,7 +2751,9 @@ impl App {
         released
     }
 
-    fn release_image_tiles(
+    /// Remove one dropped image's atlas tiles from every window of this app — the per-image step
+    /// [`Self::release_dropped_images`] runs for each entry it drains from the process-wide queue.
+    pub(crate) fn release_image_tiles(
         &mut self,
         id: ImageId,
         frame_count: usize,
